@@ -10,7 +10,8 @@ name: Security & Quality Pipeline
 # Require the "Security Gate" check in your ruleset and block direct pushes to main.
 on:
   push:
-    branches: ["**"]
+    branches: ["main"]
+    tags: ["**"]
   pull_request:
     branches: ["**"]
 
