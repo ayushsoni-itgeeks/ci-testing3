@@ -1,0 +1,110 @@
+name: "Trivy Filesystem Scan"
+description: >
+  Runs Trivy across the repository filesystem for dependency vulnerabilities,
+  secrets, IaC/Dockerfile misconfigurations, and license issues. Writes a JSON
+  report (full detail) and a SARIF report (for the GitHub Security tab), then
+  emits a `critical` count (CRITICAL/HIGH vulns + any secrets + CRITICAL/HIGH
+  misconfigs) and a `warnings` count. Like the other scanners, this action never
+  fails the build — the CALLER decides what blocks.
+
+inputs:
+  trivy-version:
+    description: "Pinned Trivy release to install."
+    required: false
+    default: "0.71.1"
+
+outputs:
+  critical:
+    description: "Blocking findings: CRITICAL/HIGH vulns + secrets + CRITICAL/HIGH misconfigs."
+    value: ${{ steps.evaluate.outputs.critical }}
+  warnings:
+    description: "Non-blocking findings: MEDIUM/LOW vulns + misconfigs + license issues."
+    value: ${{ steps.evaluate.outputs.warnings }}
+
+runs:
+  using: composite
+  steps:
+    # ------------------------------------------------------------------------
+    # Install a pinned Trivy release via the official installer.
+    # ------------------------------------------------------------------------
+    - name: Install Trivy
+      shell: bash
+      run: |
+        set -euo pipefail
+        VER="${{ inputs.trivy-version }}"
+        TARBALL="trivy_${VER}_Linux-64bit.tar.gz"
+        URL="https://github.com/aquasecurity/trivy/releases/download/v${VER}/${TARBALL}"
+        echo "Downloading ${URL}"
+        curl -sSfL -o "${TARBALL}" "${URL}"
+        tar -xzf "${TARBALL}" trivy
+        sudo mv trivy /usr/local/bin/
+        rm -f "${TARBALL}"
+        trivy --version
+
+    # ------------------------------------------------------------------------
+    # One scan, JSON output (full detail for the combined report). Covers
+    # dependency vulnerabilities, secrets, misconfigurations, and licenses.
+    # `--exit-code 0` so we always reach evaluation; the caller gates.
+    # ------------------------------------------------------------------------
+    - name: Trivy filesystem scan (JSON)
+      shell: bash
+      run: |
+        set -uo pipefail
+        trivy fs . \
+          --scanners vuln,secret,misconfig,license \
+          --severity CRITICAL,HIGH,MEDIUM,LOW \
+          --format json \
+          --output trivy-report.json \
+          --exit-code 0 \
+          --no-progress \
+          --skip-dirs node_modules \
+          || echo "Trivy (json) exited non-zero (captured for evaluation)"
+        if [ ! -s trivy-report.json ]; then echo '{}' > trivy-report.json; fi
+
+    # ------------------------------------------------------------------------
+    # SARIF output for the GitHub Security/code-scanning tab. Best-effort.
+    # ------------------------------------------------------------------------
+    - name: Trivy filesystem scan (SARIF)
+      shell: bash
+      run: |
+        set -uo pipefail
+        trivy fs . \
+          --scanners vuln,secret,misconfig,license \
+          --severity CRITICAL,HIGH,MEDIUM,LOW \
+          --format sarif \
+          --output trivy-report.sarif \
+          --exit-code 0 \
+          --no-progress \
+          --skip-dirs node_modules \
+          || echo "Trivy (sarif) exited non-zero (captured for evaluation)"
+
+    # ------------------------------------------------------------------------
+    # Classify into blocking vs warnings. No pass/fail here.
+    # ------------------------------------------------------------------------
+    - name: Evaluate Trivy results
+      id: evaluate
+      shell: bash
+      run: |
+        set -uo pipefail
+        F=trivy-report.json
+
+        VULN_CRIT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL" or .Severity=="HIGH")] | length' "$F" 2>/dev/null || echo 0)
+        VULN_WARN=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM" or .Severity=="LOW")] | length' "$F" 2>/dev/null || echo 0)
+        SECRETS=$(jq   '[.Results[]?.Secrets[]?] | length' "$F" 2>/dev/null || echo 0)
+        MISCFG_CRIT=$(jq '[.Results[]?.Misconfigurations[]? | select(.Severity=="CRITICAL" or .Severity=="HIGH")] | length' "$F" 2>/dev/null || echo 0)
+        MISCFG_WARN=$(jq '[.Results[]?.Misconfigurations[]? | select(.Severity=="MEDIUM" or .Severity=="LOW")] | length' "$F" 2>/dev/null || echo 0)
+        LICENSE=$(jq  '[.Results[]?.Licenses[]?] | length' "$F" 2>/dev/null || echo 0)
+
+        VULN_CRIT=${VULN_CRIT:-0}; VULN_WARN=${VULN_WARN:-0}; SECRETS=${SECRETS:-0}
+        MISCFG_CRIT=${MISCFG_CRIT:-0}; MISCFG_WARN=${MISCFG_WARN:-0}; LICENSE=${LICENSE:-0}
+
+        CRITICAL=$((VULN_CRIT + SECRETS + MISCFG_CRIT))
+        WARNINGS=$((VULN_WARN + MISCFG_WARN + LICENSE))
+
+        echo "Trivy blocking: vuln_crit_high=$VULN_CRIT secrets=$SECRETS misconfig_crit_high=$MISCFG_CRIT -> $CRITICAL"
+        echo "Trivy warnings: vuln_med_low=$VULN_WARN misconfig_med_low=$MISCFG_WARN license=$LICENSE -> $WARNINGS"
+
+        {
+          echo "critical=$CRITICAL"
+          echo "warnings=$WARNINGS"
+        } >> "$GITHUB_OUTPUT"

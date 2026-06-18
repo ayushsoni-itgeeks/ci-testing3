@@ -1,0 +1,105 @@
+name: "Dependency Scan"
+description: >
+  Audits npm dependencies for known vulnerabilities (npm audit), outdated
+  packages (npm outdated), and deprecation notices. Classifies findings into
+  `critical` (critical + high severity vulnerabilities -> should block) and
+  `warnings` (moderate/low vulns + outdated + deprecated -> warn only).
+  This action never fails the build; the CALLER decides what blocks.
+
+outputs:
+  critical:
+    description: "Count of critical + high severity vulnerabilities (blocking)."
+    value: ${{ steps.evaluate.outputs.critical }}
+  warnings:
+    description: "Count of non-blocking issues (moderate/low vulns, outdated, deprecated)."
+    value: ${{ steps.evaluate.outputs.warnings }}
+
+runs:
+  using: composite
+  steps:
+    # ------------------------------------------------------------------------
+    # npm audit using ONLY the lockfile — no install, no lifecycle scripts,
+    # so this is fast and safe. JSON captured for the report.
+    # ------------------------------------------------------------------------
+    - name: npm audit
+      shell: bash
+      run: |
+        set -uo pipefail
+        npm audit --package-lock-only --audit-level=low --json \
+          > npm-audit.json 2>npm-audit.log \
+          || echo "npm audit exited non-zero (vulnerabilities present; captured for evaluation)"
+
+    # ------------------------------------------------------------------------
+    # Outdated / old versions. `npm outdated` exits non-zero when anything is
+    # outdated, so we swallow it. --package-lock-only avoids a full install.
+    # ------------------------------------------------------------------------
+    - name: npm outdated
+      shell: bash
+      run: |
+        set -uo pipefail
+        npm outdated --package-lock-only --json \
+          > npm-outdated.json 2>npm-outdated.log \
+          || echo "npm outdated reported outdated packages (captured for evaluation)"
+        # Normalise an empty result to an empty JSON object.
+        if [ ! -s npm-outdated.json ]; then echo '{}' > npm-outdated.json; fi
+
+    # ------------------------------------------------------------------------
+    # Deprecation notices. npm prints "npm warn deprecated <pkg>: <reason>"
+    # during a dry-run install; capture and de-duplicate them.
+    # ------------------------------------------------------------------------
+    - name: Detect deprecated packages
+      shell: bash
+      run: |
+        set -uo pipefail
+        npm install --package-lock-only --dry-run 2>&1 \
+          | grep -i 'deprecated' \
+          | sort -u \
+          > deprecated.txt || true
+        if [ -s deprecated.txt ]; then
+          echo "::warning::Deprecated dependencies detected"
+          cat deprecated.txt
+        else
+          echo "No deprecated dependencies found."
+        fi
+
+    # ------------------------------------------------------------------------
+    # Classify findings into blocking (critical+high) vs warnings.
+    # ------------------------------------------------------------------------
+    - name: Evaluate Dependencies
+      id: evaluate
+      shell: bash
+      run: |
+        set -uo pipefail
+
+        CRIT=0; HIGH=0; MOD=0; LOW=0; INFO=0
+        if [ -s npm-audit.json ]; then
+          CRIT=$(jq '.metadata.vulnerabilities.critical // 0' npm-audit.json 2>/dev/null || echo 0)
+          HIGH=$(jq '.metadata.vulnerabilities.high // 0'     npm-audit.json 2>/dev/null || echo 0)
+          MOD=$(jq  '.metadata.vulnerabilities.moderate // 0' npm-audit.json 2>/dev/null || echo 0)
+          LOW=$(jq  '.metadata.vulnerabilities.low // 0'      npm-audit.json 2>/dev/null || echo 0)
+          INFO=$(jq '.metadata.vulnerabilities.info // 0'     npm-audit.json 2>/dev/null || echo 0)
+        fi
+
+        OUTDATED=0
+        if [ -s npm-outdated.json ]; then
+          OUTDATED=$(jq 'keys | length' npm-outdated.json 2>/dev/null || echo 0)
+        fi
+
+        DEPRECATED=0
+        if [ -s deprecated.txt ]; then
+          DEPRECATED=$(wc -l < deprecated.txt | tr -d ' ')
+        fi
+
+        CRITICAL=$((CRIT + HIGH))
+        WARNINGS=$((MOD + LOW + INFO + OUTDATED + DEPRECATED))
+
+        # Log the full breakdown for humans reading the run...
+        echo "Critical/High vulns: $CRITICAL"
+        echo "Moderate=$MOD Low=$LOW Info=$INFO Outdated=$OUTDATED Deprecated=$DEPRECATED"
+        echo "Non-blocking warnings: $WARNINGS"
+
+        # ...but only expose the two declared outputs the caller actually gates on.
+        {
+          echo "critical=$CRITICAL"
+          echo "warnings=$WARNINGS"
+        } >> "$GITHUB_OUTPUT"

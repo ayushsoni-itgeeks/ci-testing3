@@ -1,0 +1,599 @@
+name: Security & Quality Pipeline
+
+# Step-by-step CI pipeline. Stages run one after another and STOP early on failure:
+#   Stage 1  Secrets        -> if it finds anything, skip straight to the Report.
+#   Stage 2  Dependencies   -> runs only if Stage 1 is clean.
+#   Stage 3  Static analysis -> runs only if Stage 2 is clean.
+#   Report   Gate           -> always runs, prints one summary + makes pass/fail.
+#
+# Each stage only REPORTS; the Report job is the single merge gate.
+# Require the "Security Gate" check in your ruleset and block direct pushes to main.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-scan-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+jobs:
+  # Stage 1 — Secrets & credentials (full git history)
+  stage-1-secrets:
+    name: Stage 1 · Secrets & Credentials
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      findings: ${{ steps.scan.outputs.findings }}
+    steps:
+      - name: Checkout full git history
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Run secret scan
+        id: scan
+        uses: ./.github/actions/secret-scan
+
+      - name: Upload Stage 1 reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: scan-secrets
+          path: |
+            gitleaks-report.json
+            trufflehog-history.json
+            trufflehog-history.log
+            env-committed.txt
+            private-keys.txt
+            private-keys-tree.txt
+            private-keys-detail.tsv
+            private-keys-history.tsv
+            private-key-content.txt
+          if-no-files-found: ignore
+          retention-days: 1
+
+  # Stage 2 — Dependencies. Runs ONLY when Stage 1 found no secrets.
+  stage-2-deps:
+    name: Stage 2 · Dependencies & Vulnerabilities
+    needs: stage-1-secrets
+    if: needs.stage-1-secrets.outputs.findings == '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      critical: ${{ steps.deps.outputs.critical }}
+      warnings: ${{ steps.deps.outputs.warnings }}
+      trivy_critical: ${{ steps.trivy.outputs.critical }}
+      trivy_warnings: ${{ steps.trivy.outputs.warnings }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Run dependency scan (npm audit / outdated / deprecated)
+        id: deps
+        uses: ./.github/actions/dependency-scan
+
+      - name: Run Trivy scan (vulns / secrets / misconfig / license)
+        id: trivy
+        uses: ./.github/actions/trivy-scan
+
+      - name: Upload Stage 2 reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: scan-deps
+          path: |
+            npm-audit.json
+            npm-audit.log
+            npm-outdated.json
+            npm-outdated.log
+            deprecated.txt
+            trivy-report.json
+            trivy-report.sarif
+          if-no-files-found: ignore
+          retention-days: 1
+
+  # Stage 3 — Static analysis. Runs ONLY when Stage 2 had no critical findings.
+  stage-3-static:
+    name: Stage 3 · Static Code Analysis
+    needs: stage-2-deps
+    if: needs.stage-2-deps.outputs.critical == '0' && needs.stage-2-deps.outputs.trivy_critical == '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      critical: ${{ steps.static.outputs.critical }}
+      warnings: ${{ steps.static.outputs.warnings }}
+      eslint_errors: ${{ steps.static.outputs.eslint_errors }}
+      eslint_warnings: ${{ steps.static.outputs.eslint_warnings }}
+      ts_errors: ${{ steps.static.outputs.ts_errors }}
+      prettier_issues: ${{ steps.static.outputs.prettier_issues }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run static analysis (ESLint / TypeScript / Prettier)
+        id: static
+        uses: ./.github/actions/static-analysis
+
+      - name: Upload Stage 3 reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: scan-static
+          path: |
+            eslint-report.json
+            eslint.log
+            tsc.log
+            prettier.log
+          if-no-files-found: ignore
+          retention-days: 1
+
+  # Report & Gate — always runs (even when earlier stages are skipped) and
+  # makes the single pass/fail merge decision.
+  report:
+    name: Security Gate
+    needs: [stage-1-secrets, stage-2-deps, stage-3-static]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SECRETS: ${{ needs.stage-1-secrets.outputs.findings }}
+      DEP_CRITICAL: ${{ needs.stage-2-deps.outputs.critical }}
+      DEP_WARNINGS: ${{ needs.stage-2-deps.outputs.warnings }}
+      TRIVY_CRITICAL: ${{ needs.stage-2-deps.outputs.trivy_critical }}
+      TRIVY_WARNINGS: ${{ needs.stage-2-deps.outputs.trivy_warnings }}
+      ESLINT_ERRORS: ${{ needs.stage-3-static.outputs.eslint_errors }}
+      ESLINT_WARNINGS: ${{ needs.stage-3-static.outputs.eslint_warnings }}
+      TS_ERRORS: ${{ needs.stage-3-static.outputs.ts_errors }}
+      PRETTIER_ISSUES: ${{ needs.stage-3-static.outputs.prettier_issues }}
+      STATIC_CRITICAL: ${{ needs.stage-3-static.outputs.critical }}
+      STATIC_WARNINGS: ${{ needs.stage-3-static.outputs.warnings }}
+      # Did the pipeline stop early? Used to flag skipped stages in the report.
+      STAGE2_RAN: ${{ needs.stage-2-deps.result == 'success' }}
+      STAGE3_RAN: ${{ needs.stage-3-static.result == 'success' }}
+    steps:
+      - name: Download Stage 1 reports
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: scan-secrets
+          path: reports
+
+      - name: Download Stage 2 reports
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: scan-deps
+          path: reports
+
+      - name: Download Stage 3 reports
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: scan-static
+          path: reports
+
+      - name: Build combined report
+        run: |
+          set -uo pipefail
+          # Default every metric to 0 (a skipped stage produces empty outputs).
+          SECRETS="${SECRETS:-0}"
+          DEP_CRITICAL="${DEP_CRITICAL:-0}"
+          DEP_WARNINGS="${DEP_WARNINGS:-0}"
+          TRIVY_CRITICAL="${TRIVY_CRITICAL:-0}"
+          TRIVY_WARNINGS="${TRIVY_WARNINGS:-0}"
+          ESLINT_ERRORS="${ESLINT_ERRORS:-0}"
+          ESLINT_WARNINGS="${ESLINT_WARNINGS:-0}"
+          TS_ERRORS="${TS_ERRORS:-0}"
+          PRETTIER_ISSUES="${PRETTIER_ISSUES:-0}"
+          STATIC_CRITICAL="${STATIC_CRITICAL:-0}"
+          STATIC_WARNINGS="${STATIC_WARNINGS:-0}"
+
+          # Render a status cell as a colour-coded badge chip:
+          #   red FAIL (n) when blocking · green PASS when clean · grey SKIP when not run.
+          cell() {
+            if [ "${2:-true}" != "true" ]; then
+              echo "![SKIP](https://img.shields.io/badge/SKIP-8b949e?style=flat)";
+            elif [ "${1:-0}" -gt 0 ]; then
+              echo "![FAIL](https://img.shields.io/badge/FAIL%20$1-d73a49?style=flat)";
+            else
+              echo "![PASS](https://img.shields.io/badge/PASS-2ea44f?style=flat)";
+            fi
+          }
+
+          # Render a warning-count cell as a yellow chip when >0, an em dash when clean.
+          warn_cell() {
+            if [ "${1:-0}" -gt 0 ]; then
+              echo "![WARN](https://img.shields.io/badge/WARN%20$1-dbab09?style=flat)";
+            else
+              echo "—";
+            fi
+          }
+
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          mkdir -p reports
+          REPORT="reports/security-summary.md"
+          R=reports
+          TOTAL_CRIT=$((SECRETS + DEP_CRITICAL + TRIVY_CRITICAL + STATIC_CRITICAL))
+          TOTAL_WARN=$((DEP_WARNINGS + TRIVY_WARNINGS + STATIC_WARNINGS))
+          # Stage 2 combines npm + Trivy into a single line in the summary.
+          S2_CRIT=$((DEP_CRITICAL + TRIVY_CRITICAL))
+          S2_WARN=$((DEP_WARNINGS + TRIVY_WARNINGS))
+
+          {
+            echo "# Security &amp; Quality Report"
+            echo ""
+
+            # Run metadata as a compact key/value table.
+            echo "| | |"
+            echo "|---|---|"
+            echo "| **Commit** | \`${SHORT_SHA}\` |"
+            echo "| **Branch** | \`${GITHUB_REF_NAME}\` |"
+            echo "| **Trigger** | \`${GITHUB_EVENT_NAME}\` |"
+            echo "| **Run** | [#${GITHUB_RUN_ID}](${RUN_URL}) |"
+            echo ""
+
+            # Verdict: headline + the list of blockers to fix.
+            if [ "$TOTAL_CRIT" -gt 0 ]; then
+              echo "## Result: FAILED &mdash; merge blocked"
+              echo ""
+              echo "**${TOTAL_CRIT}** blocking finding(s) and **${TOTAL_WARN}** warning(s) detected."
+              echo "Resolve the blocking items below before merging."
+              echo ""
+              echo "**Action required:**"
+              echo ""
+              [ "$SECRETS" -gt 0 ]        && echo "- **Secrets** &mdash; ${SECRETS} finding(s) _(Stage 1)_"
+              [ "$DEP_CRITICAL" -gt 0 ]   && echo "- **npm vulnerabilities** &mdash; ${DEP_CRITICAL} critical/high _(Stage 2)_"
+              [ "$TRIVY_CRITICAL" -gt 0 ] && echo "- **Trivy** &mdash; ${TRIVY_CRITICAL} critical (vuln / secret / misconfig) _(Stage 2)_"
+              [ "$ESLINT_ERRORS" -gt 0 ]  && echo "- **ESLint** &mdash; ${ESLINT_ERRORS} error(s) _(Stage 3)_"
+              [ "$TS_ERRORS" -gt 0 ]      && echo "- **TypeScript** &mdash; ${TS_ERRORS} type error(s) _(Stage 3)_"
+            else
+              echo "## Result: PASSED &mdash; merge allowed"
+              echo ""
+              echo "No blocking findings. **${TOTAL_WARN}** warning(s) detected (non-blocking; review when convenient)."
+            fi
+            echo ""
+
+            # Note when the pipeline stopped early so empty rows aren't misread as "clean".
+            if [ "${STAGE2_RAN}" != "true" ]; then
+              echo "> **Note:** Pipeline stopped after Stage 1 &mdash; Stages 2 &amp; 3 were skipped."
+              echo ""
+            elif [ "${STAGE3_RAN}" != "true" ]; then
+              echo "> **Note:** Pipeline stopped after Stage 2 &mdash; Stage 3 was skipped."
+              echo ""
+            fi
+
+            # At-a-glance summary table.
+            echo "## Summary"
+            echo ""
+            echo "| Stage | Check | Status | Warnings |"
+            echo "|:-----:|:------|:------:|:--------:|"
+            echo "| 1 | Secrets &amp; credentials | $(cell "$SECRETS") | — |"
+            echo "| 2 | Dependencies &amp; vulnerabilities (npm + Trivy) | $(cell "$S2_CRIT" "$STAGE2_RAN") | $(warn_cell "$S2_WARN") |"
+            echo "| 3 | Static analysis (ESLint / TypeScript / Prettier) | $(cell "$STATIC_CRITICAL" "$STAGE3_RAN") | $(warn_cell "$STATIC_WARNINGS") |"
+            echo "| | **Total** | $(cell "$TOTAL_CRIT") | **$(warn_cell "$TOTAL_WARN")** |"
+            echo ""
+            echo "<sub>![FAIL](https://img.shields.io/badge/FAIL-d73a49?style=flat) blocks merge &nbsp;·&nbsp; ![PASS](https://img.shields.io/badge/PASS-2ea44f?style=flat) clean &nbsp;·&nbsp; ![WARN](https://img.shields.io/badge/WARN-dbab09?style=flat) non-blocking &nbsp;·&nbsp; ![SKIP](https://img.shields.io/badge/SKIP-8b949e?style=flat) not run</sub>"
+            echo ""
+            echo "## Details"
+
+            # Stage 1 detail — secrets.
+            echo ""
+            echo "### Stage 1 &middot; Secrets &amp; Credentials"
+            echo ""
+            if [ -s "$R/gitleaks-report.json" ] && [ "$(jq 'length' "$R/gitleaks-report.json" 2>/dev/null || echo 0)" -gt 0 ]; then
+              echo "**Gitleaks** &mdash; secrets found in git history:"
+              echo ""
+              echo "| Rule | File | Line | Commit |"
+              echo "|------|------|------|--------|"
+              jq -r '.[] | "| \(.RuleID // .Rule // "?") | \(.File // "?") | \(.StartLine // "?") | \((.Commit // "")[0:10]) |"' \
+                "$R/gitleaks-report.json" 2>/dev/null | head -100
+              echo ""
+            else
+              echo "- **Gitleaks** &mdash; no secrets in git history"
+            fi
+            if [ -s "$R/env-committed.txt" ]; then
+              echo "- **Committed .env files** &mdash; found:"
+              sed 's/^/    - /' "$R/env-committed.txt"
+            else
+              echo "- **Committed .env files** &mdash; none"
+            fi
+            if [ -s "$R/private-keys-detail.tsv" ]; then
+              echo "**Private key files** &mdash; found in the working tree and/or git history:"
+              echo ""
+              echo "| File | Commit | Date | Where |"
+              echo "|------|--------|------|-------|"
+              # detail.tsv columns: file \t sha \t date \t where
+              awk -F'\t' '{
+                sha = ($2=="-") ? "—" : "`" $2 "`"
+                dt  = ($3=="-") ? "—" : $3
+                printf "| `%s` | %s | %s | %s |\n", $1, sha, dt, $4
+              }' "$R/private-keys-detail.tsv" | head -100
+              echo ""
+            else
+              echo "- **Private key files (tree + history)** &mdash; none"
+            fi
+            if [ -s "$R/private-key-content.txt" ]; then
+              echo "**Private key material (PEM blocks)** &mdash; found in git history:"
+              echo ""
+              echo "| Commit | File |"
+              echo "|--------|------|"
+              # content.txt columns: sha \t file
+              awk -F'\t' '{ printf "| `%s` | `%s` |\n", $1, $2 }' "$R/private-key-content.txt" | head -100
+              echo ""
+            else
+              echo "- **Private key material in history** &mdash; none"
+            fi
+            if [ -s "$R/trufflehog-history.json" ] && grep -q '"SourceMetadata"' "$R/trufflehog-history.json" 2>/dev/null; then
+              TH=$(grep -c '"SourceMetadata"' "$R/trufflehog-history.json" 2>/dev/null || echo 0)
+              echo "- **TruffleHog** &mdash; ${TH} verified secret(s)"
+            else
+              echo "- **TruffleHog** &mdash; no verified secrets"
+            fi
+            echo ""
+
+            # Stage 2 was skipped — show why and stop here.
+            if [ "${STAGE2_RAN}" != "true" ]; then
+              echo ""
+              echo "### Stage 2 &middot; Dependencies &amp; Vulnerabilities"
+              echo ""
+              echo "_Skipped &mdash; Stage 1 found blocking issues._"
+              echo ""
+              echo "### Stage 3 &middot; Static Code Analysis"
+              echo ""
+              echo "_Skipped &mdash; Stage 1 found blocking issues._"
+            else
+              # Stage 2 detail — npm + Trivy under one combined heading.
+              echo ""
+              echo "### Stage 2 &middot; Dependencies &amp; Vulnerabilities"
+              echo ""
+
+              # --- npm audit -----------------------------------------------------
+              echo "#### npm dependencies"
+              echo ""
+              if [ -s "$R/npm-audit.json" ]; then
+                ADV=$(jq '[.vulnerabilities // {} | to_entries[] | select(.value.severity=="critical" or .value.severity=="high")] | length' "$R/npm-audit.json" 2>/dev/null || echo 0)
+                if [ "${ADV:-0}" -gt 0 ]; then
+                  echo "**Critical / high vulnerable packages:**"
+                  echo ""
+                  echo "| Package | Severity | Via | Fix available |"
+                  echo "|---------|----------|-----|---------------|"
+                  jq -r '.vulnerabilities // {} | to_entries[]
+                    | select(.value.severity=="critical" or .value.severity=="high")
+                    | "| \(.key) | \(.value.severity) | \((.value.via | map(if type=="object" then .title else . end) | join(", "))[0:60]) | \(if (.value.fixAvailable|type)=="boolean" then (.value.fixAvailable|tostring) else "yes" end) |"' \
+                    "$R/npm-audit.json" 2>/dev/null | head -100
+                  echo ""
+                else
+                  echo "- **npm audit** &mdash; no critical/high vulnerabilities"
+                fi
+              fi
+              if [ -s "$R/npm-outdated.json" ] && [ "$(jq 'keys|length' "$R/npm-outdated.json" 2>/dev/null || echo 0)" -gt 0 ]; then
+                echo "<details><summary>Outdated packages (warning)</summary>"
+                echo ""
+                echo "| Package | Current | Wanted | Latest |"
+                echo "|---------|---------|--------|--------|"
+                jq -r 'to_entries[] | "| \(.key) | \(.value.current // "-") | \(.value.wanted // "-") | \(.value.latest // "-") |"' \
+                  "$R/npm-outdated.json" 2>/dev/null | head -100
+                echo ""
+                echo "</details>"
+              else
+                echo "- **Outdated packages** &mdash; none"
+              fi
+              if [ -s "$R/deprecated.txt" ]; then
+                echo "<details><summary>Deprecated packages (warning)</summary>"
+                echo ""
+                echo '```'
+                cat "$R/deprecated.txt"
+                echo '```'
+                echo ""
+                echo "</details>"
+              else
+                echo "- **Deprecated packages** &mdash; none"
+              fi
+              echo ""
+
+              # --- Trivy ---------------------------------------------------------
+              echo "#### Trivy (filesystem scan)"
+              echo ""
+              if [ -s "$R/trivy-report.json" ]; then
+                # Blocking: critical/high vulnerabilities.
+                TV=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL" or .Severity=="HIGH")] | length' "$R/trivy-report.json" 2>/dev/null || echo 0)
+                if [ "${TV:-0}" -gt 0 ]; then
+                  echo "**Critical / high vulnerabilities (blocking):**"
+                  echo ""
+                  echo "| ID | Package | Installed | Fixed | Severity | Title |"
+                  echo "|----|---------|-----------|-------|----------|-------|"
+                  jq -r '.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL" or .Severity=="HIGH")
+                    | "| \(.VulnerabilityID) | \(.PkgName) | \(.InstalledVersion) | \(.FixedVersion // "none") | \(.Severity) | \((.Title // "-")[0:60]) |"' \
+                    "$R/trivy-report.json" 2>/dev/null | head -100
+                  echo ""
+                else
+                  echo "- **Vulnerabilities (critical/high)** &mdash; none"
+                fi
+
+                # Blocking: secrets.
+                TS=$(jq '[.Results[]?.Secrets[]?] | length' "$R/trivy-report.json" 2>/dev/null || echo 0)
+                if [ "${TS:-0}" -gt 0 ]; then
+                  echo "- **Secrets** &mdash; ${TS} finding(s):"
+                  jq -r '.Results[]?.Secrets[]? | "    - \(.RuleID): \(.Title) (\(.Severity))"' "$R/trivy-report.json" 2>/dev/null | head -50
+                else
+                  echo "- **Secrets** &mdash; none"
+                fi
+
+                # Blocking: critical/high misconfigurations.
+                TM=$(jq '[.Results[]?.Misconfigurations[]? | select(.Severity=="CRITICAL" or .Severity=="HIGH")] | length' "$R/trivy-report.json" 2>/dev/null || echo 0)
+                if [ "${TM:-0}" -gt 0 ]; then
+                  echo "- **Misconfigurations (critical/high)** &mdash; ${TM}:"
+                  jq -r '.Results[]?.Misconfigurations[]? | select(.Severity=="CRITICAL" or .Severity=="HIGH") | "    - \(.ID): \(.Title) (\(.Severity))"' "$R/trivy-report.json" 2>/dev/null | head -50
+                else
+                  echo "- **Misconfigurations (critical/high)** &mdash; none"
+                fi
+                echo ""
+
+                # ---- Warnings (non-blocking): what they are and why ----
+                echo "**Warnings (non-blocking):**"
+                echo ""
+
+                # Medium/low vulnerabilities — what package, what fix, why (title).
+                TVW=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM" or .Severity=="LOW")] | length' "$R/trivy-report.json" 2>/dev/null || echo 0)
+                if [ "${TVW:-0}" -gt 0 ]; then
+                  echo "<details><summary>Medium / low vulnerabilities (${TVW})</summary>"
+                  echo ""
+                  echo "| ID | Package | Installed | Fixed | Severity | Why (title) |"
+                  echo "|----|---------|-----------|-------|----------|-------------|"
+                  jq -r '.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM" or .Severity=="LOW")
+                    | "| \(.VulnerabilityID) | \(.PkgName) | \(.InstalledVersion) | \(.FixedVersion // "none") | \(.Severity) | \((.Title // .Description // "-")[0:70]) |"' \
+                    "$R/trivy-report.json" 2>/dev/null | head -200
+                  echo ""
+                  echo "</details>"
+                else
+                  echo "- **Medium / low vulnerabilities** &mdash; none"
+                fi
+
+                # Medium/low misconfigurations — what, where, and how to resolve.
+                TMW=$(jq '[.Results[]?.Misconfigurations[]? | select(.Severity=="MEDIUM" or .Severity=="LOW")] | length' "$R/trivy-report.json" 2>/dev/null || echo 0)
+                if [ "${TMW:-0}" -gt 0 ]; then
+                  echo "<details><summary>Medium / low misconfigurations (${TMW})</summary>"
+                  echo ""
+                  echo "| ID | Severity | Title | What &amp; how to fix |"
+                  echo "|----|----------|-------|------------------|"
+                  jq -r '.Results[]?.Misconfigurations[]? | select(.Severity=="MEDIUM" or .Severity=="LOW")
+                    | "| \(.ID) | \(.Severity) | \((.Title // "-")[0:50]) | \(((.Resolution // .Description // .Message // "-") | gsub("[\\r\\n|]"; " "))[0:90]) |"' \
+                    "$R/trivy-report.json" 2>/dev/null | head -200
+                  echo ""
+                  echo "</details>"
+                else
+                  echo "- **Medium / low misconfigurations** &mdash; none"
+                fi
+
+                # License issues — which package, which license, severity.
+                TL=$(jq '[.Results[]?.Licenses[]?] | length' "$R/trivy-report.json" 2>/dev/null || echo 0)
+                if [ "${TL:-0}" -gt 0 ]; then
+                  echo "<details><summary>License issues (${TL})</summary>"
+                  echo ""
+                  echo "| Package | License | Severity | Category |"
+                  echo "|---------|---------|----------|----------|"
+                  jq -r '.Results[]?.Licenses[]?
+                    | "| \(.PkgName // .FilePath // "-") | \(.Name // "-") | \(.Severity // "-") | \(.Category // "-") |"' \
+                    "$R/trivy-report.json" 2>/dev/null | head -200
+                  echo ""
+                  echo "</details>"
+                else
+                  echo "- **License issues** &mdash; none"
+                fi
+              else
+                echo "- _Trivy report not available._"
+              fi
+              echo ""
+
+              # Stage 3 detail — static analysis (or skip note if Stage 2 blocked).
+              echo ""
+              echo "### Stage 3 &middot; Static Code Analysis"
+              echo ""
+              if [ "${STAGE3_RAN}" != "true" ]; then
+                echo "_Skipped &mdash; Stage 2 found blocking issues._"
+              else
+                echo "| Tool | Errors (blocking) | Warnings |"
+                echo "|------|:-----------------:|:--------:|"
+                echo "| ESLint | $(cell "$ESLINT_ERRORS") | $(warn_cell "$ESLINT_WARNINGS") |"
+                echo "| TypeScript (tsc) | $(cell "$TS_ERRORS") | — |"
+                echo "| Prettier | — | $(warn_cell "$PRETTIER_ISSUES") |"
+                echo ""
+                if [ -s "$R/eslint-report.json" ] && [ "$ESLINT_ERRORS" -gt 0 ]; then
+                  echo "<details><summary>ESLint errors</summary>"
+                  echo ""
+                  echo "| File | Line | Rule | Message |"
+                  echo "|------|------|------|---------|"
+                  jq -r '.[] | .filePath as $f | .messages[] | select(.severity==2)
+                    | "| \($f | sub(".*/";"")) | \(.line) | \(.ruleId // "?") | \((.message)[0:80]) |"' \
+                    "$R/eslint-report.json" 2>/dev/null | head -100
+                  echo ""
+                  echo "</details>"
+                fi
+                if [ -s "$R/tsc.log" ] && [ "$TS_ERRORS" -gt 0 ]; then
+                  echo "<details><summary>TypeScript errors</summary>"
+                  echo ""
+                  echo '```'
+                  grep -E 'error TS[0-9]+' "$R/tsc.log" 2>/dev/null | head -100
+                  echo '```'
+                  echo ""
+                  echo "</details>"
+                fi
+                if [ -s "$R/prettier.log" ] && [ "$PRETTIER_ISSUES" -gt 0 ]; then
+                  echo "<details><summary>Files needing Prettier formatting</summary>"
+                  echo ""
+                  echo '```'
+                  grep -E '^\[warn\] ' "$R/prettier.log" 2>/dev/null | head -100
+                  echo '```'
+                  echo ""
+                  echo "</details>"
+                fi
+                if [ "$STATIC_CRITICAL" -eq 0 ] && [ "$STATIC_WARNINGS" -eq 0 ]; then
+                  echo "- No static analysis findings."
+                fi
+              fi
+            fi
+            echo ""
+            echo "---"
+            echo "<sub>Full machine-readable reports are attached as build artifacts &nbsp;·&nbsp; generated by the Security &amp; Quality Pipeline.</sub>"
+          } > "$REPORT"
+
+          # Mirror the full summary into the GitHub job summary UI.
+          cat "$REPORT" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload combined security report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: security-report-${{ github.run_id }}
+          path: reports
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Gate decision
+        run: |
+          set -uo pipefail
+          SECRETS="${SECRETS:-0}"
+          DEP_CRITICAL="${DEP_CRITICAL:-0}"
+          TRIVY_CRITICAL="${TRIVY_CRITICAL:-0}"
+          ESLINT_ERRORS="${ESLINT_ERRORS:-0}"
+          TS_ERRORS="${TS_ERRORS:-0}"
+
+          # Collect every blocking reason; fail if there is at least one.
+          BLOCK=0
+          REASONS=""
+          [ "$SECRETS" -gt 0 ]        && { BLOCK=1; REASONS="${REASONS} ${SECRETS} secret finding(s);"; }
+          [ "$DEP_CRITICAL" -gt 0 ]   && { BLOCK=1; REASONS="${REASONS} ${DEP_CRITICAL} critical/high npm vuln(s);"; }
+          [ "$TRIVY_CRITICAL" -gt 0 ] && { BLOCK=1; REASONS="${REASONS} ${TRIVY_CRITICAL} Trivy critical finding(s);"; }
+          [ "$ESLINT_ERRORS" -gt 0 ]  && { BLOCK=1; REASONS="${REASONS} ${ESLINT_ERRORS} ESLint error(s);"; }
+          [ "$TS_ERRORS" -gt 0 ]      && { BLOCK=1; REASONS="${REASONS} ${TS_ERRORS} TypeScript error(s);"; }
+
+          if [ "$BLOCK" -gt 0 ]; then
+            echo "::error::SECURITY GATE FAILED:${REASONS}"
+            echo "**Security gate: FAILED** —${REASONS}" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          else
+            echo "SECURITY GATE PASSED — no blocking findings."
+            echo "**Security gate: PASSED** — no blocking findings." >> "$GITHUB_STEP_SUMMARY"
+          fi

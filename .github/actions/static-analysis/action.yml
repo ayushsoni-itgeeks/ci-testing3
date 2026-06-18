@@ -1,0 +1,132 @@
+name: "Static Code Analysis"
+description: >
+  Runs static analysis over the source tree: ESLint (lint rules), the
+  TypeScript compiler (`tsc --noEmit` type checking) and Prettier
+  (`--check` formatting). Classifies findings into `critical` (ESLint errors +
+  TypeScript type errors -> should block) and `warnings` (ESLint warnings +
+  Prettier formatting drift -> warn only). Like the other scanners, this action
+  never fails the build — the CALLER decides what blocks.
+
+outputs:
+  critical:
+    description: "Blocking findings: ESLint errors + TypeScript type errors."
+    value: ${{ steps.evaluate.outputs.critical }}
+  warnings:
+    description: "Non-blocking findings: ESLint warnings + Prettier formatting drift."
+    value: ${{ steps.evaluate.outputs.warnings }}
+  eslint_errors:
+    description: "ESLint error count."
+    value: ${{ steps.evaluate.outputs.eslint_errors }}
+  eslint_warnings:
+    description: "ESLint warning count."
+    value: ${{ steps.evaluate.outputs.eslint_warnings }}
+  ts_errors:
+    description: "TypeScript type error count."
+    value: ${{ steps.evaluate.outputs.ts_errors }}
+  prettier_issues:
+    description: "Number of files that are not Prettier-formatted."
+    value: ${{ steps.evaluate.outputs.prettier_issues }}
+
+runs:
+  using: composite
+  steps:
+    # ------------------------------------------------------------------------
+    # ESLint — JSON report for the combined summary. `|| true` because eslint
+    # exits non-zero when it finds problems; we always reach evaluation and the
+    # caller gates. Errors block, warnings warn.
+    # ------------------------------------------------------------------------
+    - name: ESLint
+      shell: bash
+      run: |
+        set -uo pipefail
+        npx eslint . \
+          --ignore-path .gitignore \
+          --ext .js,.jsx,.ts,.tsx \
+          --format json \
+          --output-file eslint-report.json \
+          || echo "ESLint reported problems (captured for evaluation)"
+        if [ ! -s eslint-report.json ]; then echo '[]' > eslint-report.json; fi
+
+        # Human-readable mirror for the artifact / logs.
+        npx eslint . \
+          --ignore-path .gitignore \
+          --ext .js,.jsx,.ts,.tsx \
+          > eslint.log 2>&1 || true
+
+    # ------------------------------------------------------------------------
+    # TypeScript — `react-router typegen` first (generates route types) then
+    # `tsc --noEmit`. Any reported "error TS####" is a blocking type error.
+    # ------------------------------------------------------------------------
+    - name: TypeScript typecheck
+      shell: bash
+      run: |
+        set -uo pipefail
+        npx react-router typegen || echo "typegen exited non-zero (captured)"
+        npx tsc --noEmit --pretty false > tsc.log 2>&1 \
+          || echo "tsc reported type errors (captured for evaluation)"
+        if [ ! -f tsc.log ]; then : > tsc.log; fi
+
+    # ------------------------------------------------------------------------
+    # Prettier — formatting drift is a warning, never blocking. `--check` lists
+    # files that would be reformatted.
+    # ------------------------------------------------------------------------
+    - name: Prettier check
+      shell: bash
+      run: |
+        set -uo pipefail
+        npx prettier --check . > prettier.log 2>&1 \
+          || echo "Prettier reported unformatted files (captured for evaluation)"
+        if [ ! -f prettier.log ]; then : > prettier.log; fi
+
+    # ------------------------------------------------------------------------
+    # Classify findings into blocking (eslint errors + ts errors) vs warnings
+    # (eslint warnings + prettier drift). No pass/fail here.
+    # ------------------------------------------------------------------------
+    - name: Evaluate static analysis
+      id: evaluate
+      shell: bash
+      run: |
+        set -uo pipefail
+
+        ESLINT_ERRORS=0
+        ESLINT_WARNINGS=0
+        if [ -s eslint-report.json ]; then
+          ESLINT_ERRORS=$(jq   '[.[].errorCount]   | add // 0' eslint-report.json 2>/dev/null || echo 0)
+          ESLINT_WARNINGS=$(jq '[.[].warningCount] | add // 0' eslint-report.json 2>/dev/null || echo 0)
+        fi
+
+        # Count distinct "error TS####" diagnostics emitted by tsc.
+        # `grep -c` already prints 0 on no match; `|| true` only swallows its
+        # non-zero exit (using `|| echo 0` would append a SECOND line -> breaks $(( ))).
+        TS_ERRORS=0
+        if [ -s tsc.log ]; then
+          TS_ERRORS=$(grep -cE 'error TS[0-9]+' tsc.log 2>/dev/null || true)
+        fi
+
+        # Prettier prints "[warn] <file>" for each file that needs formatting.
+        # `[warn] <file>` per file; exclude the trailing "[warn] Code style…" summary line.
+        PRETTIER_ISSUES=0
+        if [ -s prettier.log ]; then
+          PRETTIER_ISSUES=$(grep -E '^\[warn\] ' prettier.log 2>/dev/null | grep -cvE 'Code style|--write' || true)
+        fi
+
+        # Normalise every value to a single, clean integer (strip stray whitespace/newlines).
+        ESLINT_ERRORS=$(printf '%s' "${ESLINT_ERRORS:-0}" | tr -cd '0-9'); ESLINT_ERRORS=${ESLINT_ERRORS:-0}
+        ESLINT_WARNINGS=$(printf '%s' "${ESLINT_WARNINGS:-0}" | tr -cd '0-9'); ESLINT_WARNINGS=${ESLINT_WARNINGS:-0}
+        TS_ERRORS=$(printf '%s' "${TS_ERRORS:-0}" | tr -cd '0-9'); TS_ERRORS=${TS_ERRORS:-0}
+        PRETTIER_ISSUES=$(printf '%s' "${PRETTIER_ISSUES:-0}" | tr -cd '0-9'); PRETTIER_ISSUES=${PRETTIER_ISSUES:-0}
+
+        CRITICAL=$((ESLINT_ERRORS + TS_ERRORS))
+        WARNINGS=$((ESLINT_WARNINGS + PRETTIER_ISSUES))
+
+        echo "Static analysis blocking: eslint_errors=$ESLINT_ERRORS ts_errors=$TS_ERRORS -> $CRITICAL"
+        echo "Static analysis warnings: eslint_warnings=$ESLINT_WARNINGS prettier=$PRETTIER_ISSUES -> $WARNINGS"
+
+        {
+          echo "critical=$CRITICAL"
+          echo "warnings=$WARNINGS"
+          echo "eslint_errors=$ESLINT_ERRORS"
+          echo "eslint_warnings=$ESLINT_WARNINGS"
+          echo "ts_errors=$TS_ERRORS"
+          echo "prettier_issues=$PRETTIER_ISSUES"
+        } >> "$GITHUB_OUTPUT"

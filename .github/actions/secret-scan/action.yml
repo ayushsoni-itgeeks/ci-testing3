@@ -1,0 +1,295 @@
+name: "Secret & Credential Scan"
+description: >
+  Runs Gitleaks + TruffleHog across full git history, checks for committed
+  .env files and private keys, uploads reports, and emits a single `findings`
+  count. The CALLER decides whether findings warn or block — this action never
+  fails the build itself.
+
+inputs:
+  gitleaks-version:
+    description: "Pinned Gitleaks release to install."
+    required: false
+    default: "8.24.2"
+
+outputs:
+  findings:
+    description: "Total number of security findings across all scanners."
+    value: ${{ steps.evaluate.outputs.findings }}
+
+runs:
+  using: composite
+  steps:
+    # ------------------------------------------------------------------------
+    # Small CLI utilities. `set -euo pipefail` makes the step fail fast.
+    # ------------------------------------------------------------------------
+    - name: Install Dependencies
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends jq wget curl ca-certificates
+
+    # ------------------------------------------------------------------------
+    # Gitleaks (pinned) + verify.
+    # ------------------------------------------------------------------------
+    - name: Install Gitleaks
+      shell: bash
+      run: |
+        set -euo pipefail
+        TARBALL="gitleaks_${{ inputs.gitleaks-version }}_linux_x64.tar.gz"
+        wget -q "https://github.com/gitleaks/gitleaks/releases/download/v${{ inputs.gitleaks-version }}/${TARBALL}"
+        tar -xzf "${TARBALL}"
+        sudo mv gitleaks /usr/local/bin/
+        gitleaks version
+
+    # ------------------------------------------------------------------------
+    # TruffleHog via official installer.
+    # ------------------------------------------------------------------------
+    - name: Install TruffleHog
+      shell: bash
+      run: |
+        set -euo pipefail
+        curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
+          | sudo sh -s -- -b /usr/local/bin
+        trufflehog --version
+
+    # ------------------------------------------------------------------------
+    # Gitleaks: scan entire git history. continue-on-error semantics via the
+    # `|| echo` so we always reach the evaluation step with a report on disk.
+    # ------------------------------------------------------------------------
+    - name: Gitleaks History Scan
+      shell: bash
+      run: |
+        set -uo pipefail
+        gitleaks git \
+          --report-format=json \
+          --report-path=gitleaks-report.json \
+          --redact \
+          --exit-code=0 \
+          || echo "Gitleaks exited non-zero (captured for later evaluation)"
+
+    # ------------------------------------------------------------------------
+    # Committed .env files across all history (ignoring example/sample/etc).
+    # ------------------------------------------------------------------------
+    - name: Check Git History for .env Files
+      shell: bash
+      run: |
+        set -uo pipefail
+        git log \
+          --all \
+          --diff-filter=A \
+          --name-only \
+          --pretty=format: \
+          | grep -E '(^|/)\.env([.-]|$)' \
+          | grep -Ev '\.env\.(example|sample|template|dist)$' \
+          | sort -u \
+          > env-committed.txt || true
+
+        if [ -s env-committed.txt ]; then
+          echo "::warning::Committed .env files detected in git history"
+          cat env-committed.txt
+        else
+          echo "No committed .env files found."
+        fi
+
+    # ------------------------------------------------------------------------
+    # Private key FILES by name — both the working tree AND the full git
+    # history. History matters: a key committed and later deleted is gone from
+    # the tree but still recoverable from any commit, so it must still block.
+    # (Mirrors the .env history check above.) Results merged into one list.
+    # ------------------------------------------------------------------------
+    - name: Check for Private Key Files (tree + history)
+      shell: bash
+      run: |
+        set -uo pipefail
+
+        # Filename pattern shared by both scans. `[.]` is a literal dot that
+        # needs no backslash — avoids awk's "escape sequence" warning.
+        KEY_RE='(^|/)([^/]+[.](pem|key|p12|pfx)|id_rsa|id_dsa|id_ecdsa|id_ed25519)$'
+
+        # --- working tree -----------------------------------------------------
+        find . \
+          -type d \( -name .git -o -name node_modules \) -prune \
+          -o -type f \( \
+               -name "*.pem" \
+            -o -name "*.key" \
+            -o -name "*.p12" \
+            -o -name "*.pfx" \
+            -o -name "id_rsa" \
+            -o -name "id_dsa" \
+            -o -name "id_ecdsa" \
+            -o -name "id_ed25519" \
+          \) -print \
+          | sed 's#^\./##' \
+          > private-keys-tree.txt || true
+
+        # --- full git history: capture the COMMIT that introduced each key -----
+        # `--diff-filter=A` = additions only, so each row is "key first appeared
+        # in this commit". awk carries the current commit (short sha + subject)
+        # down to the file lines that follow it. Output TSV: file \t sha \t subject
+        git log --all --diff-filter=A --date=short \
+          --format='COMMIT%x09%h%x09%ad%x09%s' --name-only \
+          | awk -F'\t' -v re="$KEY_RE" '
+              $1 == "COMMIT" { sha=$2; date=$3; subj=$4; next }
+              $0 ~ re && $0 !~ /(^|\/)node_modules\// { print $0 "\t" sha "\t" date "\t" subj }
+            ' \
+          | sort -u \
+          > private-keys-history.tsv || true
+
+        # --- working-tree rows (no commit — file is present in the checkout) ---
+        # Only list tree files that are NOT already recorded from history, so the
+        # detail table doesn't show the same path twice.
+        : > private-keys-tree.tsv
+        if [ -s private-keys-tree.txt ]; then
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            if ! cut -f1 private-keys-history.tsv 2>/dev/null | grep -qxF "$f"; then
+              printf '%s\t-\t-\tworking tree (current checkout)\n' "$f" >> private-keys-tree.tsv
+            fi
+          done < private-keys-tree.txt
+        fi
+
+        # --- combined detail (file \t sha \t date \t where) for the report -----
+        cat private-keys-history.tsv private-keys-tree.tsv \
+          | sed '/^$/d' \
+          | sort -u \
+          > private-keys-detail.tsv || true
+
+        # --- canonical list the evaluator counts: unique file paths ------------
+        cut -f1 private-keys-detail.tsv | sort -u | sed '/^$/d' > private-keys.txt || true
+
+        if [ -s private-keys-detail.tsv ]; then
+          echo "::warning::Private key files found in working tree and/or git history"
+          echo "file<TAB>commit<TAB>date<TAB>where"
+          cat private-keys-detail.tsv
+        else
+          echo "No private key files found."
+        fi
+
+    # ------------------------------------------------------------------------
+    # Private key MATERIAL (content) across full history. Catches a PEM block
+    # introduced in ANY commit even if the file was later removed/renamed.
+    # `-G` matches commits whose diff added/removed a line matching the regex.
+    # ------------------------------------------------------------------------
+    - name: Check Git History for Private Key Material
+      shell: bash
+      run: |
+        set -uo pipefail
+        PEM_RE='-----BEGIN ([A-Z ]+ )?PRIVATE KEY-----'
+
+        # git grep against every commit reports exact "<sha>:<path>" locations of
+        # the PEM header in that commit's snapshot — so we know commit AND file,
+        # not just "some commit". -I skips binaries; we never print the key body.
+        : > private-key-content.txt
+        for sha in $(git rev-list --all); do
+          git grep -I -l -E -e "$PEM_RE" "$sha" 2>/dev/null \
+            | sed "s/^${sha}:/${sha:0:10}\t/"
+        done | sort -u > private-key-content.txt || true
+
+        if [ -s private-key-content.txt ]; then
+          echo "::warning::Private key material found in git history"
+          echo "commit<TAB>file"
+          cat private-key-content.txt
+        else
+          echo "No private key material found in git history."
+        fi
+
+    # ------------------------------------------------------------------------
+    # TruffleHog: full history, verified-only to cut false positives.
+    # ------------------------------------------------------------------------
+    - name: TruffleHog Git History Scan
+      shell: bash
+      run: |
+        set -uo pipefail
+        trufflehog git "file://$(pwd)" \
+          --json \
+          --only-verified \
+          --no-update \
+          > trufflehog-history.json 2>trufflehog-history.log \
+          || echo "TruffleHog exited non-zero (captured for later evaluation)"
+
+    # ------------------------------------------------------------------------
+    # Tally findings and expose the count as an output. No pass/fail here —
+    # the caller job decides whether to warn (push) or block (pull_request).
+    # Report files are left in the workspace for the caller to collect/upload.
+    # ------------------------------------------------------------------------
+    - name: Evaluate Results
+      id: evaluate
+      shell: bash
+      run: |
+        set -uo pipefail
+        FINDINGS=0
+        # NOTE: this action intentionally does NOT write to $GITHUB_STEP_SUMMARY.
+        # The Stage 4 "Security Gate" job rebuilds one combined summary for all
+        # stages, so per-stage summaries are only emitted to the console logs.
+
+        # ----- Gitleaks -----
+        echo "===== GITLEAKS ====="
+        GL_COUNT=0
+        if [ -f gitleaks-report.json ]; then
+          GL_COUNT=$(jq 'length' gitleaks-report.json 2>/dev/null || echo 0)
+        fi
+        if [ "$GL_COUNT" -gt 0 ]; then
+          echo "❌ Gitleaks found $GL_COUNT secret(s)"
+          FINDINGS=$((FINDINGS + GL_COUNT))
+        else
+          echo "✅ No Gitleaks findings"
+        fi
+
+        # ----- .env files -----
+        echo "===== ENV FILES ====="
+        if [ -s env-committed.txt ]; then
+          EN_COUNT=$(wc -l < env-committed.txt | tr -d ' ')
+          echo "❌ .env files detected in git history"
+          cat env-committed.txt
+          FINDINGS=$((FINDINGS + EN_COUNT))
+        else
+          echo "✅ No committed .env files"
+        fi
+
+        # ----- Private key files (tree + history) -----
+        echo "===== PRIVATE KEY FILES ====="
+        if [ -s private-keys.txt ]; then
+          PK_COUNT=$(wc -l < private-keys.txt | tr -d ' ')
+          echo "❌ Private key files found (working tree and/or git history)"
+          cat private-keys.txt
+          FINDINGS=$((FINDINGS + PK_COUNT))
+        else
+          echo "✅ No private key files"
+        fi
+
+        # ----- Private key material in history (PEM blocks); one row per commit:file -----
+        echo "===== PRIVATE KEY MATERIAL (HISTORY) ====="
+        if [ -s private-key-content.txt ]; then
+          PKM_COUNT=$(grep -c . private-key-content.txt 2>/dev/null || true)
+          PKM_COUNT=${PKM_COUNT:-0}
+          if [ "$PKM_COUNT" -gt 0 ]; then
+            echo "❌ Private key material found in $PKM_COUNT commit/file location(s)"
+            cat private-key-content.txt
+            FINDINGS=$((FINDINGS + PKM_COUNT))
+          else
+            echo "✅ No private key material in history"
+          fi
+        else
+          echo "✅ No private key material in history"
+        fi
+
+        # ----- TruffleHog (verified findings only; one per JSON line) -----
+        echo "===== TRUFFLEHOG ====="
+        TH_COUNT=0
+        if [ -s trufflehog-history.json ]; then
+          # grep -c prints "0" AND exits non-zero on no-match; `|| true`
+          # swallows the exit so we keep a single clean integer.
+          TH_COUNT=$(grep -c '"SourceMetadata"' trufflehog-history.json 2>/dev/null || true)
+          TH_COUNT=${TH_COUNT:-0}
+        fi
+        if [ "$TH_COUNT" -gt 0 ]; then
+          echo "❌ TruffleHog found $TH_COUNT verified finding(s)"
+          FINDINGS=$((FINDINGS + TH_COUNT))
+        else
+          echo "✅ No TruffleHog findings"
+        fi
+
+        echo ""
+        echo "Total findings: $FINDINGS"
+        echo "findings=$FINDINGS" >> "$GITHUB_OUTPUT"
