@@ -148,11 +148,53 @@ jobs:
           if-no-files-found: ignore
           retention-days: 1
 
+  # Stage 4 — Build, Test & Docker. Runs ONLY when Stage 3 had no critical findings.
+  stage-4-build:
+    name: Stage 4 · Build, Test & Docker
+    needs: stage-3-static
+    if: needs.stage-3-static.outputs.critical == '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      critical: ${{ steps.build.outputs.critical }}
+      build_failed: ${{ steps.build.outputs.build_failed }}
+      test_failed: ${{ steps.build.outputs.test_failed }}
+      test_status: ${{ steps.build.outputs.test_status }}
+      docker_failed: ${{ steps.build.outputs.docker_failed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run build / test / docker
+        id: build
+        uses: ./.github/actions/build-test
+
+      - name: Upload Stage 4 reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: scan-build
+          path: |
+            build.log
+            test.log
+            docker-build.log
+          if-no-files-found: ignore
+          retention-days: 1
+
   # Report & Gate — always runs (even when earlier stages are skipped) and
   # makes the single pass/fail merge decision.
   report:
     name: Security Gate
-    needs: [stage-1-secrets, stage-2-deps, stage-3-static]
+    needs: [stage-1-secrets, stage-2-deps, stage-3-static, stage-4-build]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -168,9 +210,15 @@ jobs:
       PRETTIER_ISSUES: ${{ needs.stage-3-static.outputs.prettier_issues }}
       STATIC_CRITICAL: ${{ needs.stage-3-static.outputs.critical }}
       STATIC_WARNINGS: ${{ needs.stage-3-static.outputs.warnings }}
+      BUILD_FAILED: ${{ needs.stage-4-build.outputs.build_failed }}
+      TEST_FAILED: ${{ needs.stage-4-build.outputs.test_failed }}
+      TEST_STATUS: ${{ needs.stage-4-build.outputs.test_status }}
+      DOCKER_FAILED: ${{ needs.stage-4-build.outputs.docker_failed }}
+      BUILD_CRITICAL: ${{ needs.stage-4-build.outputs.critical }}
       # Did the pipeline stop early? Used to flag skipped stages in the report.
       STAGE2_RAN: ${{ needs.stage-2-deps.result == 'success' }}
       STAGE3_RAN: ${{ needs.stage-3-static.result == 'success' }}
+      STAGE4_RAN: ${{ needs.stage-4-build.result == 'success' }}
     steps:
       - name: Download Stage 1 reports
         continue-on-error: true
@@ -193,6 +241,13 @@ jobs:
           name: scan-static
           path: reports
 
+      - name: Download Stage 4 reports
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: scan-build
+          path: reports
+
       - name: Build combined report
         run: |
           set -uo pipefail
@@ -208,6 +263,11 @@ jobs:
           PRETTIER_ISSUES="${PRETTIER_ISSUES:-0}"
           STATIC_CRITICAL="${STATIC_CRITICAL:-0}"
           STATIC_WARNINGS="${STATIC_WARNINGS:-0}"
+          BUILD_FAILED="${BUILD_FAILED:-0}"
+          TEST_FAILED="${TEST_FAILED:-0}"
+          TEST_STATUS="${TEST_STATUS:-skip}"
+          DOCKER_FAILED="${DOCKER_FAILED:-0}"
+          BUILD_CRITICAL="${BUILD_CRITICAL:-0}"
 
           # Render a status cell as a colour-coded badge chip:
           #   red FAIL (n) when blocking · green PASS when clean · grey SKIP when not run.
@@ -236,7 +296,7 @@ jobs:
           mkdir -p reports
           REPORT="reports/security-summary.md"
           R=reports
-          TOTAL_CRIT=$((SECRETS + DEP_CRITICAL + TRIVY_CRITICAL + STATIC_CRITICAL))
+          TOTAL_CRIT=$((SECRETS + DEP_CRITICAL + TRIVY_CRITICAL + STATIC_CRITICAL + BUILD_CRITICAL))
           TOTAL_WARN=$((DEP_WARNINGS + TRIVY_WARNINGS + STATIC_WARNINGS))
           # Stage 2 combines npm + Trivy into a single line in the summary.
           S2_CRIT=$((DEP_CRITICAL + TRIVY_CRITICAL))
@@ -269,6 +329,9 @@ jobs:
               [ "$TRIVY_CRITICAL" -gt 0 ] && echo "- **Trivy** &mdash; ${TRIVY_CRITICAL} critical (vuln / secret / misconfig) _(Stage 2)_"
               [ "$ESLINT_ERRORS" -gt 0 ]  && echo "- **ESLint** &mdash; ${ESLINT_ERRORS} error(s) _(Stage 3)_"
               [ "$TS_ERRORS" -gt 0 ]      && echo "- **TypeScript** &mdash; ${TS_ERRORS} type error(s) _(Stage 3)_"
+              [ "$BUILD_FAILED" -gt 0 ]   && echo "- **Build** &mdash; \`npm run build\` failed _(Stage 4)_"
+              [ "$TEST_FAILED" -gt 0 ]    && echo "- **Tests** &mdash; Vitest suite failed _(Stage 4)_"
+              [ "$DOCKER_FAILED" -gt 0 ]  && echo "- **Docker build** &mdash; image build failed _(Stage 4)_"
             else
               echo "## Result: PASSED &mdash; merge allowed"
               echo ""
@@ -278,10 +341,13 @@ jobs:
 
             # Note when the pipeline stopped early so empty rows aren't misread as "clean".
             if [ "${STAGE2_RAN}" != "true" ]; then
-              echo "> **Note:** Pipeline stopped after Stage 1 &mdash; Stages 2 &amp; 3 were skipped."
+              echo "> **Note:** Pipeline stopped after Stage 1 &mdash; Stages 2, 3 &amp; 4 were skipped."
               echo ""
             elif [ "${STAGE3_RAN}" != "true" ]; then
-              echo "> **Note:** Pipeline stopped after Stage 2 &mdash; Stage 3 was skipped."
+              echo "> **Note:** Pipeline stopped after Stage 2 &mdash; Stages 3 &amp; 4 were skipped."
+              echo ""
+            elif [ "${STAGE4_RAN}" != "true" ]; then
+              echo "> **Note:** Pipeline stopped after Stage 3 &mdash; Stage 4 was skipped."
               echo ""
             fi
 
@@ -293,6 +359,7 @@ jobs:
             echo "| 1 | Secrets &amp; credentials | $(cell "$SECRETS") | — |"
             echo "| 2 | Dependencies &amp; vulnerabilities (npm + Trivy) | $(cell "$S2_CRIT" "$STAGE2_RAN") | $(warn_cell "$S2_WARN") |"
             echo "| 3 | Static analysis (ESLint / TypeScript / Prettier) | $(cell "$STATIC_CRITICAL" "$STAGE3_RAN") | $(warn_cell "$STATIC_WARNINGS") |"
+            echo "| 4 | Build, Test &amp; Docker | $(cell "$BUILD_CRITICAL" "$STAGE4_RAN") | — |"
             echo "| | **Total** | $(cell "$TOTAL_CRIT") | **$(warn_cell "$TOTAL_WARN")** |"
             echo ""
             echo "<sub>![FAIL](https://img.shields.io/badge/FAIL-d73a49?style=flat) blocks merge &nbsp;·&nbsp; ![PASS](https://img.shields.io/badge/PASS-2ea44f?style=flat) clean &nbsp;·&nbsp; ![WARN](https://img.shields.io/badge/WARN-dbab09?style=flat) non-blocking &nbsp;·&nbsp; ![SKIP](https://img.shields.io/badge/SKIP-8b949e?style=flat) not run</sub>"
@@ -362,6 +429,10 @@ jobs:
               echo "_Skipped &mdash; Stage 1 found blocking issues._"
               echo ""
               echo "### Stage 3 &middot; Static Code Analysis"
+              echo ""
+              echo "_Skipped &mdash; Stage 1 found blocking issues._"
+              echo ""
+              echo "### Stage 4 &middot; Build, Test &amp; Docker"
               echo ""
               echo "_Skipped &mdash; Stage 1 found blocking issues._"
             else
@@ -554,6 +625,61 @@ jobs:
                   echo "- No static analysis findings."
                 fi
               fi
+
+              # Stage 4 detail — build / test / docker (or skip note if Stage 3 blocked).
+              echo ""
+              echo "### Stage 4 &middot; Build, Test &amp; Docker"
+              echo ""
+              if [ "${STAGE4_RAN}" != "true" ]; then
+                echo "_Skipped &mdash; Stage 3 found blocking issues._"
+              else
+                # Test cell reflects tolerant outcome: PASS / FAIL / SKIP (no tests yet).
+                case "$TEST_STATUS" in
+                  pass) TEST_CELL="![PASS](https://img.shields.io/badge/PASS-2ea44f?style=flat)";;
+                  fail) TEST_CELL="![FAIL](https://img.shields.io/badge/FAIL-d73a49?style=flat)";;
+                  *)    TEST_CELL="![SKIP](https://img.shields.io/badge/SKIP-8b949e?style=flat)";;
+                esac
+                echo "| Check | Status |"
+                echo "|-------|:------:|"
+                echo "| Build (\`npm run build\`) | $(cell "$BUILD_FAILED") |"
+                echo "| Tests (Vitest) | ${TEST_CELL} |"
+                echo "| Docker build | $(cell "$DOCKER_FAILED") |"
+                echo ""
+                if [ "$TEST_STATUS" = "skip" ]; then
+                  echo "> Tests skipped &mdash; no Vitest runner or \`test\` script detected in the repo yet."
+                  echo ""
+                fi
+                if [ -s "$R/build.log" ] && [ "$BUILD_FAILED" -gt 0 ]; then
+                  echo "<details><summary>Build output</summary>"
+                  echo ""
+                  echo '```'
+                  tail -100 "$R/build.log" 2>/dev/null
+                  echo '```'
+                  echo ""
+                  echo "</details>"
+                fi
+                if [ -s "$R/test.log" ] && [ "$TEST_FAILED" -gt 0 ]; then
+                  echo "<details><summary>Test output</summary>"
+                  echo ""
+                  echo '```'
+                  tail -100 "$R/test.log" 2>/dev/null
+                  echo '```'
+                  echo ""
+                  echo "</details>"
+                fi
+                if [ -s "$R/docker-build.log" ] && [ "$DOCKER_FAILED" -gt 0 ]; then
+                  echo "<details><summary>Docker build output</summary>"
+                  echo ""
+                  echo '```'
+                  tail -100 "$R/docker-build.log" 2>/dev/null
+                  echo '```'
+                  echo ""
+                  echo "</details>"
+                fi
+                if [ "$BUILD_CRITICAL" -eq 0 ]; then
+                  echo "- Build, tests and Docker build all OK."
+                fi
+              fi
             fi
             echo ""
             echo "---"
@@ -580,6 +706,9 @@ jobs:
           TRIVY_CRITICAL="${TRIVY_CRITICAL:-0}"
           ESLINT_ERRORS="${ESLINT_ERRORS:-0}"
           TS_ERRORS="${TS_ERRORS:-0}"
+          BUILD_FAILED="${BUILD_FAILED:-0}"
+          TEST_FAILED="${TEST_FAILED:-0}"
+          DOCKER_FAILED="${DOCKER_FAILED:-0}"
 
           # Collect every blocking reason; fail if there is at least one.
           BLOCK=0
@@ -589,6 +718,9 @@ jobs:
           [ "$TRIVY_CRITICAL" -gt 0 ] && { BLOCK=1; REASONS="${REASONS} ${TRIVY_CRITICAL} Trivy critical finding(s);"; }
           [ "$ESLINT_ERRORS" -gt 0 ]  && { BLOCK=1; REASONS="${REASONS} ${ESLINT_ERRORS} ESLint error(s);"; }
           [ "$TS_ERRORS" -gt 0 ]      && { BLOCK=1; REASONS="${REASONS} ${TS_ERRORS} TypeScript error(s);"; }
+          [ "$BUILD_FAILED" -gt 0 ]   && { BLOCK=1; REASONS="${REASONS} build failed;"; }
+          [ "$TEST_FAILED" -gt 0 ]    && { BLOCK=1; REASONS="${REASONS} tests failed;"; }
+          [ "$DOCKER_FAILED" -gt 0 ]  && { BLOCK=1; REASONS="${REASONS} docker build failed;"; }
 
           if [ "$BLOCK" -gt 0 ]; then
             echo "::error::SECURITY GATE FAILED:${REASONS}"

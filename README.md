@@ -1,5 +1,7 @@
 # Shopify App Template - React Router
 
+<!-- CI self-test (test7): trivial doc change to verify a fully clean PR passes all 3 stages. -->
+
 This is a template for building a [Shopify app](https://shopify.dev/docs/apps/getting-started) using [React Router](https://reactrouter.com/). It was forked from the [Shopify Remix app template](https://github.com/Shopify/shopify-app-template-remix) and converted to React Router.
 
 Rather than cloning this repo, follow the [Quick Start steps](https://github.com/Shopify/shopify-app-template-react-router#quick-start).
