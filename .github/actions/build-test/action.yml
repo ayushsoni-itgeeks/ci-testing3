@@ -1,0 +1,131 @@
+name: "Build, Test & Docker"
+description: >
+  Verifies the app actually builds and ships. Runs three checks:
+  the application build (`npm run build`), the unit tests (Vitest, tolerant —
+  skipped cleanly when no runner/tests exist yet) and a full Docker image build
+  from the repo Dockerfile. Build and Docker failures are `critical` (block the
+  merge); the test step only contributes to `critical` when tests exist AND fail.
+  Like the other scanners, this action never fails the build itself — the CALLER
+  decides what blocks.
+
+outputs:
+  critical:
+    description: "Blocking findings: build failure + docker build failure + (real) test failure."
+    value: ${{ steps.evaluate.outputs.critical }}
+  build_failed:
+    description: "1 if `npm run build` failed, else 0."
+    value: ${{ steps.evaluate.outputs.build_failed }}
+  test_failed:
+    description: "1 if tests existed and failed, else 0."
+    value: ${{ steps.evaluate.outputs.test_failed }}
+  test_status:
+    description: "pass | fail | skip — outcome of the Vitest step."
+    value: ${{ steps.evaluate.outputs.test_status }}
+  docker_failed:
+    description: "1 if the Docker image build failed, else 0."
+    value: ${{ steps.evaluate.outputs.docker_failed }}
+
+runs:
+  using: composite
+  steps:
+    # ------------------------------------------------------------------------
+    # Application build — `npm run build` (react-router build). Blocking.
+    # Output captured; exit code recorded for the caller to gate on.
+    # ------------------------------------------------------------------------
+    - name: Build
+      id: build
+      shell: bash
+      run: |
+        set -uo pipefail
+        if npm run build > build.log 2>&1; then
+          echo "build_failed=0" >> "$GITHUB_OUTPUT"
+          echo "Build succeeded."
+        else
+          echo "build_failed=1" >> "$GITHUB_OUTPUT"
+          echo "Build FAILED (captured for evaluation)."
+        fi
+        if [ ! -f build.log ]; then : > build.log; fi
+
+    # ------------------------------------------------------------------------
+    # Unit tests — Vitest, tolerant. Runs only when a runner is present:
+    #   - vitest binary installed  -> `vitest run --passWithNoTests`
+    #   - else a `test` npm script -> `npm test`
+    #   - else                     -> skip cleanly (no tests in repo yet)
+    # `--passWithNoTests` keeps "runner present, zero tests" a pass, not a fail.
+    # ------------------------------------------------------------------------
+    - name: Test (Vitest, tolerant)
+      id: test
+      shell: bash
+      run: |
+        set -uo pipefail
+        if [ -x node_modules/.bin/vitest ]; then
+          if npx vitest run --passWithNoTests > test.log 2>&1; then
+            echo "test_status=pass" >> "$GITHUB_OUTPUT"
+            echo "test_failed=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "test_status=fail" >> "$GITHUB_OUTPUT"
+            echo "test_failed=1" >> "$GITHUB_OUTPUT"
+          fi
+        elif jq -e '.scripts.test // empty' package.json >/dev/null 2>&1; then
+          if npm test > test.log 2>&1; then
+            echo "test_status=pass" >> "$GITHUB_OUTPUT"
+            echo "test_failed=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "test_status=fail" >> "$GITHUB_OUTPUT"
+            echo "test_failed=1" >> "$GITHUB_OUTPUT"
+          fi
+        else
+          echo "No Vitest binary or 'test' script detected — skipping tests." > test.log
+          echo "test_status=skip" >> "$GITHUB_OUTPUT"
+          echo "test_failed=0" >> "$GITHUB_OUTPUT"
+        fi
+        if [ ! -f test.log ]; then : > test.log; fi
+
+    # ------------------------------------------------------------------------
+    # Docker image build — full build from the repo Dockerfile. Blocking.
+    # Tag is throwaway; we only care that the image builds.
+    # ------------------------------------------------------------------------
+    - name: Docker build
+      id: docker
+      shell: bash
+      run: |
+        set -uo pipefail
+        if docker build -t ci-build:${GITHUB_SHA:0:7} . > docker-build.log 2>&1; then
+          echo "docker_failed=0" >> "$GITHUB_OUTPUT"
+          echo "Docker build succeeded."
+        else
+          echo "docker_failed=1" >> "$GITHUB_OUTPUT"
+          echo "Docker build FAILED (captured for evaluation)."
+        fi
+        if [ ! -f docker-build.log ]; then : > docker-build.log; fi
+
+    # ------------------------------------------------------------------------
+    # Classify: build + docker + (real) test failures are blocking. No pass/fail
+    # here — the caller's Security Gate makes the merge decision.
+    # ------------------------------------------------------------------------
+    - name: Evaluate build/test/docker
+      id: evaluate
+      shell: bash
+      run: |
+        set -uo pipefail
+        BUILD_FAILED="${{ steps.build.outputs.build_failed }}"
+        TEST_FAILED="${{ steps.test.outputs.test_failed }}"
+        TEST_STATUS="${{ steps.test.outputs.test_status }}"
+        DOCKER_FAILED="${{ steps.docker.outputs.docker_failed }}"
+
+        BUILD_FAILED=$(printf '%s' "${BUILD_FAILED:-0}" | tr -cd '0-9'); BUILD_FAILED=${BUILD_FAILED:-0}
+        TEST_FAILED=$(printf '%s' "${TEST_FAILED:-0}" | tr -cd '0-9');   TEST_FAILED=${TEST_FAILED:-0}
+        DOCKER_FAILED=$(printf '%s' "${DOCKER_FAILED:-0}" | tr -cd '0-9'); DOCKER_FAILED=${DOCKER_FAILED:-0}
+        TEST_STATUS="${TEST_STATUS:-skip}"
+
+        CRITICAL=$((BUILD_FAILED + TEST_FAILED + DOCKER_FAILED))
+
+        echo "Build/Test/Docker blocking: build=$BUILD_FAILED test=$TEST_FAILED ($TEST_STATUS) docker=$DOCKER_FAILED -> $CRITICAL"
+
+        {
+          echo "critical=$CRITICAL"
+          echo "build_failed=$BUILD_FAILED"
+          echo "test_failed=$TEST_FAILED"
+          echo "test_status=$TEST_STATUS"
+          echo "docker_failed=$DOCKER_FAILED"
+        } >> "$GITHUB_OUTPUT"
